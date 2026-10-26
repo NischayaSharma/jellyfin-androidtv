@@ -580,7 +580,7 @@ class SyncPlayService(
 				if (generation != expectedGeneration || playbackGeneration != expectedPlaybackGeneration) return@withLock
 				if (group.value == null || identity() != sessionIdentity) return@withLock
 				try {
-					withContext(Dispatchers.IO) { block() }
+					request { block() }
 				} catch (exception: CancellationException) {
 					throw exception
 				} catch (exception: Exception) {
