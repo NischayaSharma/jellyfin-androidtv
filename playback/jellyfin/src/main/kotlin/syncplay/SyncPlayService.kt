@@ -190,7 +190,7 @@ class SyncPlayService(
 	suspend fun refreshGroups() = operation("Unable to load SyncPlay groups.") {
 		val expectedGeneration = generation
 		val expectedIdentity = identity()
-		val available = api.syncPlayApi.syncPlayGetGroups().content
+		val available = request { api.syncPlayApi.syncPlayGetGroups().content }
 		if (generation != expectedGeneration || identity() != expectedIdentity) return@operation
 		_groups.value = available
 		group.value?.groupId?.let { id -> _groups.value.firstOrNull { it.groupId == id }?.let { _group.value = it } }
@@ -201,7 +201,7 @@ class SyncPlayService(
 		beginJoin()
 		val expectedGeneration = generation
 		joiningRequestSent = true
-		val created = api.syncPlayApi.syncPlayCreateGroup(NewGroupRequestDto(name.trim())).content
+		val created = request { api.syncPlayApi.syncPlayCreateGroup(NewGroupRequestDto(name.trim())).content }
 		if (expectedGeneration == generation && sessionIdentity == identity()) acceptGroup(created)
 	}
 
@@ -209,14 +209,14 @@ class SyncPlayService(
 		beginJoin()
 		val result = requireNotNull(joinResult)
 		joiningRequestSent = true
-		api.syncPlayApi.syncPlayJoinGroup(JoinGroupRequestDto(id))
+		request { api.syncPlayApi.syncPlayJoinGroup(JoinGroupRequestDto(id)) }
 		withTimeout(JOIN_TIMEOUT_MILLIS) { require(result.await().groupId == id) }
 	}
 
 	suspend fun leaveGroup() = operation("Unable to leave the SyncPlay group.") {
 		val wasJoined = group.value != null || joining
 		reset(stopPlayback = false)
-		if (wasJoined) api.syncPlayApi.syncPlayLeaveGroup()
+		if (wasJoined) request { api.syncPlayApi.syncPlayLeaveGroup() }
 	}
 
 	/** Called before changing server/user credentials; do not send requests with the next session. */
@@ -227,7 +227,7 @@ class SyncPlayService(
 		_error.value = null
 		if (wasJoined) {
 			try {
-				withTimeout(LEAVE_TIMEOUT_MILLIS) { api.syncPlayApi.syncPlayLeaveGroup() }
+				withTimeout(LEAVE_TIMEOUT_MILLIS) { request { api.syncPlayApi.syncPlayLeaveGroup() } }
 			} catch (_: TimeoutCancellationException) {
 				// Logout must still finish when the old server is unreachable.
 			} catch (exception: CancellationException) {
@@ -241,7 +241,7 @@ class SyncPlayService(
 	/** Start a title/playlist selected while grouped, instead of replacing only the TV's queue. */
 	suspend fun playItems(ids: List<UUID>, index: Int, position: Duration) = operation("Unable to start group playback.") {
 		require(group.value != null && ids.isNotEmpty() && index in ids.indices)
-		api.syncPlayApi.syncPlaySetNewQueue(PlayRequestDto(ids, index, position.inWholeTicks))
+		request { api.syncPlayApi.syncPlaySetNewQueue(PlayRequestDto(ids, index, position.inWholeTicks)) }
 	}
 
 	/** Add media to the shared playlist without changing the TV's local queue ahead of the server. */
@@ -251,7 +251,7 @@ class SyncPlayService(
 	}
 
 	private suspend fun beginJoin() {
-		if (group.value != null) api.syncPlayApi.syncPlayLeaveGroup()
+		if (group.value != null) request { api.syncPlayApi.syncPlayLeaveGroup() }
 		reset(stopPlayback = false)
 		joining = true
 		joinResult = CompletableDeferred()
@@ -284,7 +284,7 @@ class SyncPlayService(
 				delay(if (samples < INITIAL_TIME_SAMPLES) INITIAL_TIME_INTERVAL else TIME_INTERVAL)
 				try {
 					measureTime()
-					api.syncPlayApi.syncPlayPing(PingRequestDto(clock.pingMillis))
+					request { api.syncPlayApi.syncPlayPing(PingRequestDto(clock.pingMillis)) }
 					samples++
 				} catch (exception: CancellationException) {
 					throw exception
@@ -298,7 +298,7 @@ class SyncPlayService(
 
 	private suspend fun measureTime() {
 		val measurement = clock.beginMeasurement()
-		val response = api.timeSyncApi.getUtcTime().content
+		val response = request { api.timeSyncApi.getUtcTime().content }
 		clock.completeMeasurement(measurement, response.requestReceptionTime.epochMillis, response.responseTransmissionTime.epochMillis)
 	}
 
@@ -346,7 +346,8 @@ class SyncPlayService(
 		val expectedIdentity = identity()
 		coroutineScope.launch(Dispatchers.Main.immediate) {
 			try {
-				val info = api.syncPlayApi.syncPlayGetGroups().content.firstOrNull { it.groupId == groupId } ?: return@launch
+				val info = request { api.syncPlayApi.syncPlayGetGroups().content }
+					.firstOrNull { it.groupId == groupId } ?: return@launch
 				if (generation != expectedGeneration || identity() != expectedIdentity) return@launch
 				val current = group.value ?: return@launch
 				if (current.groupId == groupId && info.lastUpdatedAt >= current.lastUpdatedAt) _group.value = info
@@ -384,7 +385,7 @@ class SyncPlayService(
 		currentEntry = null
 		bufferJob?.cancel()
 		val expectedGeneration = generation
-		val item = api.userLibraryApi.getItem(next.itemId).content
+		val item = request { api.userLibraryApi.getItem(next.itemId).content }
 		if (generation != expectedGeneration) return
 		val entry = createBaseItemQueueEntry(api, item).also {
 			it.initialPlayback = InitialPlayback(update.startPositionTicks.ticks, playWhenReady = false)
@@ -406,7 +407,7 @@ class SyncPlayService(
 			override suspend fun getItem(index: Int): QueueEntry? {
 				val queueItem = update.playlist.getOrNull(index) ?: return null
 				return queueEntries[queueItem.playlistItemId] ?: createBaseItemQueueEntry(
-					api, api.userLibraryApi.getItem(queueItem.itemId).content
+					api, request { api.userLibraryApi.getItem(queueItem.itemId).content }
 				).also { queueEntries[queueItem.playlistItemId] = it }
 			}
 		}, update.playingItemIndex)
@@ -577,7 +578,7 @@ class SyncPlayService(
 				if (generation != expectedGeneration || playbackGeneration != expectedPlaybackGeneration) return@withLock
 				if (group.value == null || identity() != sessionIdentity) return@withLock
 				try {
-					block()
+					withContext(Dispatchers.IO) { block() }
 				} catch (exception: CancellationException) {
 					throw exception
 				} catch (exception: Exception) {
@@ -621,7 +622,7 @@ class SyncPlayService(
 		reset(stopPlayback = false)
 		if (leave) {
 			try {
-				withTimeout(LEAVE_TIMEOUT_MILLIS) { api.syncPlayApi.syncPlayLeaveGroup() }
+				withTimeout(LEAVE_TIMEOUT_MILLIS) { request { api.syncPlayApi.syncPlayLeaveGroup() } }
 			} catch (_: TimeoutCancellationException) {
 				// Local state is already detached.
 			} catch (exception: CancellationException) {
@@ -639,10 +640,15 @@ class SyncPlayService(
 		if (wasJoined) {
 			// A failed playback request may be inside the request job that reset just cancelled.
 			withContext(NonCancellable) {
-				try { withTimeout(LEAVE_TIMEOUT_MILLIS) { api.syncPlayApi.syncPlayLeaveGroup() } } catch (_: Exception) { }
+				try {
+					withTimeout(LEAVE_TIMEOUT_MILLIS) { request { api.syncPlayApi.syncPlayLeaveGroup() } }
+				} catch (_: Exception) { }
 			}
 		}
 	}
+
+	/** The SDK performs response-body I/O on the caller's dispatcher. Keep it off Fire OS's UI thread. */
+	private suspend fun <T> request(block: suspend () -> T): T = withContext(Dispatchers.IO) { block() }
 
 	private fun resetCorrection() {
 		correctionJob?.cancel()
