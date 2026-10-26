@@ -407,7 +407,7 @@ private class ServiceFixture(val testScope: TestScope) {
 	val groupInfo = GroupInfoDto(UUID.randomUUID(), "Movie night", GroupStateType.IDLE, listOf("Viewer"), date(0))
 	private val clock = SyncPlayClock({ epoch + testScope.testScheduler.currentTime }, { testScope.testScheduler.currentTime * 1_000_000 })
 	val speed = MutableStateFlow(1.5f)
-	val service = SyncPlayService(api, clock)
+	val service = SyncPlayService(api, clock, dispatcher)
 
 	init {
 		Dispatchers.setMain(dispatcher)

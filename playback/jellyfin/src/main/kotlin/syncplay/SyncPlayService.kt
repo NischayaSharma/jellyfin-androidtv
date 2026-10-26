@@ -2,6 +2,7 @@ package org.jellyfin.playback.jellyfin.syncplay
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -89,6 +90,7 @@ import kotlin.time.Duration.Companion.milliseconds
 class SyncPlayService(
 	private val api: ApiClient,
 	private val clock: SyncPlayClock = SyncPlayClock(),
+	private val requestDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : PlayerService(), PlayerCommandHandler {
 	private val _group = MutableStateFlow<GroupInfoDto?>(null)
 	val group = _group.asStateFlow()
@@ -648,7 +650,7 @@ class SyncPlayService(
 	}
 
 	/** The SDK performs response-body I/O on the caller's dispatcher. Keep it off Fire OS's UI thread. */
-	private suspend fun <T> request(block: suspend () -> T): T = withContext(Dispatchers.IO) { block() }
+	private suspend fun <T> request(block: suspend () -> T): T = withContext(requestDispatcher) { block() }
 
 	private fun resetCorrection() {
 		correctionJob?.cancel()
