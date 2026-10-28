@@ -58,6 +58,7 @@ fun PlaybackController.setSubtitleIndex(index: Int, force: Boolean = false) {
 
 	// Already using this subtitle index
 	if (mCurrentOptions.subtitleStreamIndex == index && !force) return
+	invalidateNextEpisodePrewarm()
 
 	// Save subtitle language preference for restoration after NextUp screen
 	val videoQueueManager by fragment.inject<VideoQueueManager>()

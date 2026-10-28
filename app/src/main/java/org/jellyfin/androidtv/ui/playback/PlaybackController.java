@@ -50,6 +50,8 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import kotlin.Lazy;
 import timber.log.Timber;
@@ -59,6 +61,8 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     private final static long PROGRESS_REPORTING_INTERVAL = TimeUtils.secondsToMillis(3);
     // Frequency to report paused state
     private static final long PROGRESS_REPORTING_PAUSE_INTERVAL = TimeUtils.secondsToMillis(15);
+    // Start server-side work early enough to cover subtitle/font extraction on the next episode.
+    private static final long NEXT_EPISODE_PREWARM_WINDOW = TimeUnit.MINUTES.toMillis(4);
 
     private Lazy<PlaybackManager> playbackManager = inject(PlaybackManager.class);
     private Lazy<UserPreferences> userPreferences = inject(UserPreferences.class);
@@ -75,6 +79,8 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     private PlaybackState mPlaybackState = PlaybackState.IDLE;
 
     private StreamInfo mCurrentStreamInfo;
+    @Nullable
+    private UUID mPrewarmRequestedItemId;
 
     private final InteractionTrackerViewModel interactionTracker;
 
@@ -163,6 +169,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     public void setItems(List<BaseItemDto> items) {
+        invalidateNextEpisodePrewarm();
         mItems = items;
         mCurrentIndex = 0;
     }
@@ -195,23 +202,26 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     public MediaSourceInfo getCurrentMediaSource() {
         if (mCurrentStreamInfo != null && mCurrentStreamInfo.getMediaSource() != null) {
             return mCurrentStreamInfo.getMediaSource();
-        } else {
-            BaseItemDto item = getCurrentlyPlayingItem();
-            List<MediaSourceInfo> mediaSources = item.getMediaSources();
+        }
 
-            if (mediaSources == null || mediaSources.isEmpty()) {
-                return null;
-            } else {
-                // Prefer the media source with the same id as the item
-                for (MediaSourceInfo mediaSource : mediaSources) {
-                    if (item.getId().equals(UUIDSerializerKt.toUUIDOrNull(mediaSource.getId()))) {
-                        return mediaSource;
-                    }
-                }
-                // Or fallback to the first media source if none match
-                return mediaSources.get(0);
+        return getMediaSourceForItem(getCurrentlyPlayingItem());
+    }
+
+    @Nullable
+    private MediaSourceInfo getMediaSourceForItem(@Nullable BaseItemDto item) {
+        if (item == null) return null;
+
+        List<MediaSourceInfo> mediaSources = item.getMediaSources();
+        if (mediaSources == null || mediaSources.isEmpty()) return null;
+
+        // Prefer the media source with the same id as the item.
+        for (MediaSourceInfo mediaSource : mediaSources) {
+            if (item.getId().equals(UUIDSerializerKt.toUUIDOrNull(mediaSource.getId()))) {
+                return mediaSource;
             }
         }
+
+        return mediaSources.get(0);
     }
 
     public StreamInfo getCurrentStreamInfo() {
@@ -526,21 +536,47 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             internalOptions.setSubtitleStreamIndex(mCurrentOptions.getSubtitleStreamIndex());
             internalOptions.setAudioStreamIndex(mCurrentOptions.getAudioStreamIndex());
         }
+
+        MediaSourceInfo itemMediaSource = getMediaSourceForItem(item);
+        String lastSubtitleLanguage = videoQueueManager.getValue().getLastPlayedSubtitleLanguageIsoCode();
+        if (lastSubtitleLanguage != null) {
+            if (lastSubtitleLanguage.isEmpty()) {
+                internalOptions.setSubtitleStreamIndex(-1);
+            } else if (itemMediaSource != null && itemMediaSource.getMediaStreams() != null) {
+                Integer requestedSubtitleIndex = internalOptions.getSubtitleStreamIndex();
+                Integer matchingSubtitleIndex = null;
+                for (MediaStream stream : itemMediaSource.getMediaStreams()) {
+                    if (stream.getType() == MediaStreamType.SUBTITLE && lastSubtitleLanguage.equals(stream.getLanguage())) {
+                        if (matchingSubtitleIndex == null) matchingSubtitleIndex = stream.getIndex();
+                        if (requestedSubtitleIndex != null && requestedSubtitleIndex.equals(stream.getIndex())) {
+                            matchingSubtitleIndex = requestedSubtitleIndex;
+                            break;
+                        }
+                    }
+                }
+                internalOptions.setSubtitleStreamIndex(matchingSubtitleIndex);
+            }
+        }
         if (forcedSubtitleIndex != null) {
             internalOptions.setSubtitleStreamIndex(forcedSubtitleIndex);
         }
-        MediaSourceInfo currentMediaSource = getCurrentMediaSource();
-        if (forcedAudioLanguage != null) {
-            // find the first audio stream with the requested language
-            for (MediaStream stream : currentMediaSource.getMediaStreams()) {
+        if (forcedAudioLanguage != null && itemMediaSource != null && itemMediaSource.getMediaStreams() != null) {
+            // Keep the same track when possible because one language can have multiple mixes.
+            Integer requestedAudioIndex = internalOptions.getAudioStreamIndex();
+            Integer matchingAudioIndex = null;
+            for (MediaStream stream : itemMediaSource.getMediaStreams()) {
                 if (stream.getType() == MediaStreamType.AUDIO && forcedAudioLanguage.equals(stream.getLanguage())) {
-                    internalOptions.setAudioStreamIndex(stream.getIndex());
-                    break;
+                    if (matchingAudioIndex == null) matchingAudioIndex = stream.getIndex();
+                    if (requestedAudioIndex != null && requestedAudioIndex.equals(stream.getIndex())) {
+                        matchingAudioIndex = requestedAudioIndex;
+                        break;
+                    }
                 }
             }
+            internalOptions.setAudioStreamIndex(matchingAudioIndex);
         }
-        if (!isLiveTv && currentMediaSource != null) {
-            internalOptions.setMediaSourceId(currentMediaSource.getId());
+        if (!isLiveTv && itemMediaSource != null) {
+            internalOptions.setMediaSourceId(itemMediaSource.getId());
         }
         DeviceProfile internalProfile = DeviceProfileKt.createDeviceProfile(
                 mFragment.getContext(),
@@ -824,6 +860,8 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             return;
         }
 
+        invalidateNextEpisodePrewarm();
+
         // get current timestamp first
         refreshCurrentPosition();
 
@@ -898,6 +936,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     public void endPlayback(Boolean closeActivity) {
+        if (closeActivity) invalidateNextEpisodePrewarm();
         if (closeActivity && mFragment != null) {
             mFragment.closePlayer();
         }
@@ -942,6 +981,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     public void prev() {
         Timber.d("Prev called.");
         if (mCurrentIndex > 0 && mItems.size() > 0) {
+            invalidateNextEpisodePrewarm();
             stop();
             resetPlayerErrors();
             mCurrentIndex--;
@@ -1120,6 +1160,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                     long currentTime = isLiveTv ? getTimeShiftedProgress() : mCurrentPosition;
 
                     reportingHelper.getValue().reportProgress(mFragment, PlaybackController.this, getCurrentlyPlayingItem(), getCurrentStreamInfo(), currentTime * 10000, false);
+                    maybePrewarmNextEpisode();
                 }
                 if (mPlaybackState != PlaybackState.UNDEFINED && mPlaybackState != PlaybackState.IDLE) {
                     mHandler.postDelayed(this, PROGRESS_REPORTING_INTERVAL);
@@ -1127,6 +1168,35 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             }
         };
         mHandler.postDelayed(mReportLoop, PROGRESS_REPORTING_INTERVAL);
+    }
+
+    private void maybePrewarmNextEpisode() {
+        if (isLiveTv || mPlaybackState != PlaybackState.PLAYING) return;
+
+        BaseItemDto currentItem = getCurrentlyPlayingItem();
+        BaseItemDto nextItem = getNextItem();
+        if (currentItem == null || nextItem == null
+                || currentItem.getType() != BaseItemKind.EPISODE
+                || nextItem.getType() != BaseItemKind.EPISODE
+                || nextItem.getLocationType() == LocationType.VIRTUAL) {
+            return;
+        }
+
+        long duration = getDuration();
+        long remaining = duration - mCurrentPosition;
+        if (duration <= 0 || remaining <= 0 || remaining > NEXT_EPISODE_PREWARM_WINDOW) return;
+        if (nextItem.getId().equals(mPrewarmRequestedItemId)) return;
+
+        String forcedAudioLanguage = videoQueueManager.getValue().getLastPlayedAudioLanguageIsoCode();
+        VideoOptions options = buildExoPlayerOptions(null, forcedAudioLanguage, nextItem);
+        mPrewarmRequestedItemId = nextItem.getId();
+        Timber.i("Prewarming next episode %s with %d ms remaining", nextItem.getId(), remaining);
+        playbackManager.getValue().prewarmVideoStreamInfo(options, 0L);
+    }
+
+    void invalidateNextEpisodePrewarm() {
+        mPrewarmRequestedItemId = null;
+        playbackManager.getValue().cancelVideoStreamPrewarm();
     }
 
     private void startPauseReportLoop() {
