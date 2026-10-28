@@ -294,6 +294,10 @@ class PlaybackManager(
 			if (prewarmEntry === entry) prewarmEntry = null
 		}
 		entry.monitorJob?.cancel()
+		// Foreground playback now owns this exact session and will issue its own HLS request.
+		// Stop the redundant warm request; ownership prevents its cancellation cleanup from
+		// terminating the handed-off server session.
+		entry.warmJob.cancel()
 		Timber.i("Reusing prewarmed playback session for %s", key.itemId)
 		return stream
 	}
