@@ -303,7 +303,7 @@ class ExoPlayerBackend(
 			exoPlayer.currentMediaItemIndex - 1 -> exoPlayer.seekToPreviousMediaItem()
 			exoPlayer.currentMediaItemIndex + 1 -> exoPlayer.seekToNextMediaItem()
 			exoPlayer.currentMediaItemIndex -> Unit
-			else -> exoPlayer.seekTo(preparedItemIndex, 0)
+			else -> exoPlayer.seekTo(requireNotNull(preparedItemIndex), 0)
 		}
 
 		// Update audio attributes
