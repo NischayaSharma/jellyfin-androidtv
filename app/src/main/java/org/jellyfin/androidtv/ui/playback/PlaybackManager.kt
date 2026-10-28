@@ -307,7 +307,7 @@ class PlaybackManager(
 		val request = Request.Builder().url(url).get().build()
 		return prewarmClient.newCall(request).awaitResponse().use { response ->
 			check(response.isSuccessful) { "HLS prewarm request failed with HTTP ${response.code}" }
-			response.body.string()
+			requireNotNull(response.body) { "HLS prewarm response had no body" }.string()
 		}
 	}
 
@@ -315,7 +315,7 @@ class PlaybackManager(
 		val request = Request.Builder().url(url).get().build()
 		prewarmClient.newCall(request).awaitResponse().use { response ->
 			check(response.isSuccessful) { "HLS prewarm request failed with HTTP ${response.code}" }
-			response.body.byteStream().use { input ->
+			requireNotNull(response.body) { "HLS prewarm response had no body" }.byteStream().use { input ->
 				val buffer = ByteArray(64 * 1024)
 				var remaining = MAX_PREWARM_RESOURCE_BYTES
 				while (remaining > 0) {
