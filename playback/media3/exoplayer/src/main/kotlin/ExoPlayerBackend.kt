@@ -136,6 +136,11 @@ class ExoPlayerBackend(
 			.setPauseAtEndOfMediaItems(true)
 			.build()
 			.also { player ->
+				player.preloadConfiguration = if (exoPlayerOptions.nextItemPreloadDuration > Duration.ZERO) {
+					ExoPlayer.PreloadConfiguration(exoPlayerOptions.nextItemPreloadDuration.inWholeMicroseconds)
+				} else {
+					ExoPlayer.PreloadConfiguration.DEFAULT
+				}
 				player.addListener(PlayerListener())
 
 				if (exoPlayerOptions.enableDebugLogging) {
@@ -228,19 +233,51 @@ class ExoPlayerBackend(
 		}
 	}
 
+	private fun findMediaItemIndex(mediaId: String): Int? =
+		(0 until exoPlayer.mediaItemCount).firstOrNull { index ->
+			exoPlayer.getMediaItemAt(index).mediaId == mediaId
+		}
+
 	override fun prepareItem(item: QueueEntry) {
 		val stream = requireNotNull(item.mediaStream)
+		val mediaId = stream.hashCode().toString()
 		val mediaItem = MediaItem.Builder().apply {
 			setTag(item)
-			setMediaId(stream.hashCode().toString())
+			setMediaId(mediaId)
 			setUri(stream.url)
 		}.build()
 
-		// Remove any excessive items from the start
-		while (exoPlayer.mediaItemCount > MEDIA_ITEM_COUNT_MAX - 1) exoPlayer.removeMediaItem(0)
+		val currentIndex = exoPlayer.currentMediaItemIndex
+		val hasCurrentItem = currentIndex in 0 until exoPlayer.mediaItemCount
+		val existingIndex = findMediaItemIndex(mediaId)
 
-		// Add new item to the end of the media item list
-		exoPlayer.addMediaItem(mediaItem)
+		when {
+			// A request to prepare the current item is already satisfied.
+			hasCurrentItem && existingIndex == currentIndex -> Unit
+
+			// Keep the prepared item immediately after the current item so Media3's playlist
+			// preloader recognizes it as the successor. Moving an item from before the current
+			// item shifts the current index down by one.
+			existingIndex != null && hasCurrentItem -> {
+				val successorIndex = if (existingIndex < currentIndex) currentIndex else currentIndex + 1
+				if (existingIndex != successorIndex) exoPlayer.moveMediaItem(existingIndex, successorIndex)
+			}
+
+			// An already prepared item is reusable even when no item is currently selected.
+			existingIndex != null -> Unit
+
+			// Insert the item as the immediate successor instead of accumulating it at the end.
+			hasCurrentItem -> exoPlayer.addMediaItem(currentIndex + 1, mediaItem)
+			else -> exoPlayer.addMediaItem(mediaItem)
+		}
+
+		// Prefer discarding playback history. When the current item is first, discard the
+		// furthest future item so neither current playback nor its successor is removed.
+		while (exoPlayer.mediaItemCount > MEDIA_ITEM_COUNT_MAX) {
+			val selectedIndex = exoPlayer.currentMediaItemIndex
+			val removalIndex = if (selectedIndex == 0) exoPlayer.mediaItemCount - 1 else 0
+			exoPlayer.removeMediaItem(removalIndex)
+		}
 
 		// Instruct exoplayer to prepare
 		exoPlayer.prepare()
@@ -252,14 +289,13 @@ class ExoPlayerBackend(
 
 		currentStream = stream
 
-		var preparedItemIndex = (0 until exoPlayer.mediaItemCount).firstOrNull { index ->
-			exoPlayer.getMediaItemAt(index).mediaId == stream.hashCode().toString()
-		}
+		val mediaId = stream.hashCode().toString()
+		var preparedItemIndex = findMediaItemIndex(mediaId)
 
 		// Prepare the item now if it doesn't exist yet
 		if (preparedItemIndex == null) {
 			prepareItem(item)
-			preparedItemIndex = exoPlayer.mediaItemCount - 1
+			preparedItemIndex = findMediaItemIndex(mediaId)
 		}
 
 		// Seek to prepared media item

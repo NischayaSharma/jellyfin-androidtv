@@ -21,6 +21,8 @@ class PlaybackManagerBuilder(context: Context) {
 	// Options
 	var defaultRewindAmount: (() -> Duration)? = null
 	var defaultFastForwardAmount: (() -> Duration)? = null
+	// Resolve the successor this long before the current item ends.
+	var mediaStreamPreloadDuration: Duration = 15.seconds
 
 	fun install(pluginFactory: PlaybackPlugin) {
 		factories.add(pluginFactory)
@@ -50,7 +52,7 @@ class PlaybackManagerBuilder(context: Context) {
 
 		// Add default services
 		services.add(QueueService())
-		services.add(MediaStreamService(mediaStreamResolvers, 15.seconds))
+		services.add(MediaStreamService(mediaStreamResolvers, mediaStreamPreloadDuration))
 		services.add(TimedEventService())
 
 		// Only support a single backend right now
