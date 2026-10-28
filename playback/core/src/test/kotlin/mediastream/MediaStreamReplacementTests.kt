@@ -26,11 +26,10 @@ import org.jellyfin.playback.core.backend.PlayerBackend
 import org.jellyfin.playback.core.queue.QueueEntry
 import org.jellyfin.playback.core.queue.QueueService
 import kotlin.time.Duration
-import kotlin.time.Duration.Companion.seconds
 
 class MediaStreamReplacementTests : FunSpec({
 	test("replacing a loading item cancels its resolver and starts the authoritative item immediately") {
-		runTest(timeout = 10.seconds) {
+		runTest {
 			val dispatcher = StandardTestDispatcher(testScheduler)
 			Dispatchers.setMain(dispatcher)
 			val scope = CoroutineScope(SupervisorJob() + dispatcher)
