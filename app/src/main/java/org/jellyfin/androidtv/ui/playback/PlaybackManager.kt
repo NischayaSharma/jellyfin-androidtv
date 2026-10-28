@@ -3,12 +3,16 @@ package org.jellyfin.androidtv.ui.playback
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -33,8 +37,10 @@ import timber.log.Timber
 import java.io.IOException
 import java.net.URI
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 private fun createStreamInfo(
 	api: ApiClient,
@@ -91,18 +97,37 @@ class PlaybackManager(
 		val startTimeTicks: Long,
 	)
 
-	private data class PrewarmEntry(
+	private enum class PrewarmOwnership {
+		AVAILABLE,
+		HANDED_OFF,
+		DISCARDED,
+	}
+
+	private class PrewarmEntry(
 		val key: PrewarmKey,
 		val createdAtMillis: Long,
-		val job: kotlinx.coroutines.Deferred<Result<Unit>>,
+		val stream: CompletableDeferred<StreamInfo>,
+		val ownership: AtomicReference<PrewarmOwnership>,
+		val warmJob: Deferred<Result<Unit>>,
+	) {
+		var monitorJob: Job? = null
+	}
+
+	private data class PrewarmFailure(
+		val key: PrewarmKey,
+		val retryAfterMillis: Long,
 	)
 
 	private val prewarmScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 	private val prewarmLock = Any()
 	private var prewarmEntry: PrewarmEntry? = null
+	private var prewarmFailure: PrewarmFailure? = null
 	private val prewarmClient: OkHttpClient by lazy {
 		OkHttpFactory().createClient(
-			api.httpClientOptions.copy(requestTimeout = Duration.ZERO)
+			api.httpClientOptions.copy(
+				requestTimeout = Duration.ZERO,
+				socketTimeout = Duration.ZERO,
+			)
 		)
 	}
 
@@ -112,7 +137,11 @@ class PlaybackManager(
 		startTimeTicks: Long,
 		callback: Response<StreamInfo>,
 	) = lifecycleOwner.lifecycleScope.launch {
-		awaitMatchingPrewarm(options, startTimeTicks)
+		val prewarmedStream = takeMatchingPrewarm(options, startTimeTicks)
+		if (prewarmedStream != null) {
+			callback.onResponse(prewarmedStream)
+			return@launch
+		}
 
 		getVideoStreamInfoInternal(options, startTimeTicks).fold(
 			onSuccess = { callback.onResponse(it) },
@@ -132,33 +161,41 @@ class PlaybackManager(
 		var staleEntry: PrewarmEntry? = null
 
 		synchronized(prewarmLock) {
+			val failure = prewarmFailure
+			if (failure != null) {
+				if (failure.key == key && now < failure.retryAfterMillis) return
+				prewarmFailure = null
+			}
+
 			val current = prewarmEntry
 			if (current != null && current.key == key && now - current.createdAtMillis < PREWARM_RETENTION.inWholeMilliseconds) {
 				return
 			}
 
 			staleEntry = current
-			val job = prewarmScope.async {
-				prewarmVideoStream(optionsSnapshot, startTimeTicks)
+			val stream = CompletableDeferred<StreamInfo>()
+			val ownership = AtomicReference(PrewarmOwnership.AVAILABLE)
+			val warmJob = prewarmScope.async {
+				prewarmVideoStream(optionsSnapshot, startTimeTicks, stream, ownership)
 			}
-			prewarmEntry = PrewarmEntry(key, now, job)
-
-			job.invokeOnCompletion { error ->
-				when {
-					error is CancellationException -> Timber.d("Next item prewarm cancelled for %s", key.itemId)
-					error != null -> Timber.w(error, "Next item prewarm failed for %s", key.itemId)
-				}
+			warmJob.invokeOnCompletion {
+				// A job cancelled before its body starts cannot complete the stream result itself.
+				if (!stream.isCompleted) stream.cancel()
 			}
+			val entry = PrewarmEntry(key, now, stream, ownership, warmJob)
+			prewarmEntry = entry
+			entry.monitorJob = prewarmScope.launch { monitorPrewarm(entry) }
 		}
 
-		staleEntry?.job?.cancel()
+		staleEntry?.let(::discardPrewarm)
 	}
 
 	fun cancelVideoStreamPrewarm() {
 		val entry = synchronized(prewarmLock) {
+			prewarmFailure = null
 			prewarmEntry.also { prewarmEntry = null }
 		}
-		entry?.job?.cancel()
+		entry?.let(::discardPrewarm)
 	}
 
 	fun changeVideoStream(
@@ -213,15 +250,16 @@ class PlaybackManager(
 		createStreamInfo(api, options, response)
 	}
 
-	private suspend fun awaitMatchingPrewarm(options: VideoOptions, startTimeTicks: Long) {
+	private suspend fun takeMatchingPrewarm(options: VideoOptions, startTimeTicks: Long): StreamInfo? {
 		val key = options.prewarmKey(startTimeTicks)
+		var staleEntry: PrewarmEntry? = null
 		val entry = synchronized(prewarmLock) {
 			val current = prewarmEntry
 			when {
 				current == null -> null
 				System.currentTimeMillis() - current.createdAtMillis >= PREWARM_RETENTION.inWholeMilliseconds -> {
 					prewarmEntry = null
-					current.job.cancel()
+					staleEntry = current
 					null
 				}
 				current.key == key -> current
@@ -229,36 +267,47 @@ class PlaybackManager(
 					// The target is now playing with different stream preferences. Do not leave a
 					// second transcode running for the stale selection.
 					prewarmEntry = null
-					current.job.cancel()
+					staleEntry = current
 					null
 				}
 				else -> null
 			}
 		}
+		staleEntry?.let(::discardPrewarm)
 
-		if (entry == null) return
+		if (entry == null) return null
 
-		Timber.i("Waiting for next item prewarm to finish for %s", key.itemId)
-		val result = try {
-			entry.job.await()
+		val stream = try {
+			entry.stream.await()
 		} catch (error: CancellationException) {
 			if (!currentCoroutineContext().isActive) throw error
-			Result.failure(error)
+			return null
+		} catch (error: Throwable) {
+			Timber.w(error, "Next item prewarm did not produce a stream for %s", key.itemId)
+			return null
 		}
-		result.onFailure { error ->
-			if (error !is CancellationException) {
-				Timber.w(error, "Next item prewarm did not complete for %s", key.itemId)
-			}
+
+		if (!entry.ownership.compareAndSet(PrewarmOwnership.AVAILABLE, PrewarmOwnership.HANDED_OFF)) {
+			return null
 		}
 		synchronized(prewarmLock) {
 			if (prewarmEntry === entry) prewarmEntry = null
 		}
+		entry.monitorJob?.cancel()
+		Timber.i("Reusing prewarmed playback session for %s", key.itemId)
+		return stream
 	}
 
-	private suspend fun prewarmVideoStream(options: VideoOptions, startTimeTicks: Long): Result<Unit> {
+	private suspend fun prewarmVideoStream(
+		options: VideoOptions,
+		startTimeTicks: Long,
+		streamResult: CompletableDeferred<StreamInfo>,
+		ownership: AtomicReference<PrewarmOwnership>,
+	): Result<Unit> {
 		var stream: StreamInfo? = null
 		return try {
 			stream = getVideoStreamInfoInternal(options, startTimeTicks).getOrThrow()
+			streamResult.complete(stream)
 			if (stream.playMethod != PlayMethod.DIRECT_PLAY && stream.mediaUrl?.contains(".m3u8", ignoreCase = true) == true) {
 				Timber.i("Prewarming next item HLS stream for %s", options.itemId)
 				prewarmHls(stream.mediaUrl!!)
@@ -266,19 +315,91 @@ class PlaybackManager(
 			Timber.i("Next item prewarm complete for %s", options.itemId)
 			Result.success(Unit)
 		} catch (error: CancellationException) {
+			streamResult.cancel(error)
+			stopFailedPrewarm(stream, ownership)
 			throw error
 		} catch (error: Throwable) {
+			streamResult.completeExceptionally(error)
+			stopFailedPrewarm(stream, ownership)
 			Timber.w(error, "Unable to prewarm next item %s", options.itemId)
 			Result.failure(error)
-		} finally {
-			val warmedStream = stream
-			if (warmedStream?.playSessionId != null && warmedStream.playMethod != PlayMethod.DIRECT_PLAY) {
-				withContext(NonCancellable + Dispatchers.IO) {
-					runCatching {
-						api.hlsSegmentApi.stopEncodingProcess(api.deviceInfo.id, warmedStream.playSessionId)
-					}.onFailure { Timber.d(it, "Unable to stop completed next item prewarm") }
-				}
+		}
+	}
+
+	private suspend fun monitorPrewarm(entry: PrewarmEntry) {
+		val result = try {
+			entry.warmJob.await()
+		} catch (error: CancellationException) {
+			if (currentCoroutineContext().isActive) {
+				recordPrewarmFailure(entry)
+				Timber.w(error, "Next item prewarm was interrupted for %s; retry will be allowed", entry.key.itemId)
 			}
+			return
+		}
+
+		if (result.isFailure) {
+			val error = result.exceptionOrNull()
+			recordPrewarmFailure(entry)
+			Timber.w(error, "Next item prewarm failed for %s; retry will be allowed", entry.key.itemId)
+			return
+		}
+
+		val expiresAt = entry.createdAtMillis + PREWARM_RETENTION.inWholeMilliseconds
+		delay((expiresAt - System.currentTimeMillis()).coerceAtLeast(0L))
+		val shouldDiscard = synchronized(prewarmLock) {
+			if (prewarmEntry === entry) {
+				prewarmEntry = null
+				true
+			} else {
+				false
+			}
+		}
+		if (shouldDiscard) discardPrewarm(entry)
+	}
+
+	private fun recordPrewarmFailure(entry: PrewarmEntry) {
+		synchronized(prewarmLock) {
+			if (prewarmEntry === entry) {
+				prewarmEntry = null
+				prewarmFailure = PrewarmFailure(
+					entry.key,
+					System.currentTimeMillis() + PREWARM_FAILURE_BACKOFF.inWholeMilliseconds,
+				)
+			}
+		}
+	}
+
+	private fun discardPrewarm(entry: PrewarmEntry) {
+		if (!entry.ownership.compareAndSet(PrewarmOwnership.AVAILABLE, PrewarmOwnership.DISCARDED)) return
+
+		entry.monitorJob?.cancel()
+		entry.warmJob.cancel()
+		prewarmScope.launch {
+			val stream = try {
+				entry.stream.await()
+			} catch (_: Throwable) {
+				null
+			}
+			stream?.let { stopPrewarmedStream(it, "discarded") }
+		}
+	}
+
+	private suspend fun stopFailedPrewarm(
+		stream: StreamInfo?,
+		ownership: AtomicReference<PrewarmOwnership>,
+	) {
+		if (!ownership.compareAndSet(PrewarmOwnership.AVAILABLE, PrewarmOwnership.DISCARDED)) return
+		if (stream != null) stopPrewarmedStream(stream, "failed")
+	}
+
+	private suspend fun stopPrewarmedStream(stream: StreamInfo, reason: String) {
+		val playSessionId = stream.playSessionId ?: return
+		if (stream.playMethod == PlayMethod.DIRECT_PLAY) return
+
+		withContext(NonCancellable + Dispatchers.IO) {
+			runCatching {
+				api.hlsSegmentApi.stopEncodingProcess(api.deviceInfo.id, playSessionId)
+			}.onFailure { Timber.d(it, "Unable to stop %s next item prewarm", reason) }
 		}
 	}
 
@@ -331,15 +452,11 @@ class PlaybackManager(
 		continuation.invokeOnCancellation { cancel() }
 		enqueue(object : Callback {
 			override fun onFailure(call: Call, error: IOException) {
-				if (continuation.isActive) continuation.resumeWith(Result.failure(error))
+				continuation.resumeWith(Result.failure(error))
 			}
 
 			override fun onResponse(call: Call, response: okhttp3.Response) {
-				if (continuation.isActive) {
-					continuation.resumeWith(Result.success(response))
-				} else {
-					response.close()
-				}
+				continuation.resume(response) { _, value, _ -> value.close() }
 			}
 		})
 	}
@@ -373,6 +490,7 @@ class PlaybackManager(
 
 	private companion object {
 		val PREWARM_RETENTION = 15.minutes
+		val PREWARM_FAILURE_BACKOFF = 15.seconds
 		const val MAX_PLAYLIST_DEPTH = 3
 		const val MAX_PREWARM_RESOURCE_BYTES = 16 * 1024 * 1024
 	}

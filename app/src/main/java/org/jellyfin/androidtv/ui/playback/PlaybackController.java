@@ -50,7 +50,6 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import kotlin.Lazy;
@@ -79,9 +78,6 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     private PlaybackState mPlaybackState = PlaybackState.IDLE;
 
     private StreamInfo mCurrentStreamInfo;
-    @Nullable
-    private UUID mPrewarmRequestedItemId;
-
     private final InteractionTrackerViewModel interactionTracker;
 
     @Nullable
@@ -1185,17 +1181,12 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         long duration = getDuration();
         long remaining = duration - mCurrentPosition;
         if (duration <= 0 || remaining <= 0 || remaining > NEXT_EPISODE_PREWARM_WINDOW) return;
-        if (nextItem.getId().equals(mPrewarmRequestedItemId)) return;
-
         String forcedAudioLanguage = videoQueueManager.getValue().getLastPlayedAudioLanguageIsoCode();
         VideoOptions options = buildExoPlayerOptions(null, forcedAudioLanguage, nextItem);
-        mPrewarmRequestedItemId = nextItem.getId();
-        Timber.i("Prewarming next episode %s with %d ms remaining", nextItem.getId(), remaining);
         playbackManager.getValue().prewarmVideoStreamInfo(options, 0L);
     }
 
     void invalidateNextEpisodePrewarm() {
-        mPrewarmRequestedItemId = null;
         playbackManager.getValue().cancelVideoStreamPrewarm();
     }
 
